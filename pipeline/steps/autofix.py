@@ -27,13 +27,92 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
+
+REMOVE_CODES = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+DROP_LINE_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+LINE_CODES = DROP_LINE_CODES | {"BOX_OUT_OF_IMAGE"}
+
+
+def _clip_yolo_line(raw: str) -> str | None:
+    """Cắt box về trong [0, 1]; trả None nếu không còn diện tích dương."""
+    try:
+        cls_id, cx, cy, w, h = parse_yolo_line(raw)
+    except ValueError:
+        return None
+    x1 = max(0.0, min(1.0, cx - w / 2))
+    y1 = max(0.0, min(1.0, cy - h / 2))
+    x2 = max(0.0, min(1.0, cx + w / 2))
+    y2 = max(0.0, min(1.0, cy + h / 2))
+    nw, nh = x2 - x1, y2 - y1
+    if nw <= 0 or nh <= 0:
+        return None
+    ncx, ncy = (x1 + x2) / 2, (y1 + y2) / 2
+    return f"{cls_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    """Tự động sửa các lỗi bắt buộc (ERROR) trong ds và trả danh sách thay đổi."""
+    err_issues = [i for i in issues if i.severity == ERROR]
+    fixes = []
+    removed_images = set()
+    renamed_classes = False
+
+    for i in err_issues:
+        if i.code in REMOVE_CODES and i.image not in removed_images:
+            removed_images.add(i.image)
+            img_p = ds.image_path(i.image)
+            if img_p is not None and img_p.exists():
+                img_p.unlink()
+            lbl_p = ds.label_path(i.image)
+            if lbl_p.exists():
+                lbl_p.unlink()
+            fixes.append(dict(image=i.image, line="", action="remove_image", before=i.code, after="đã xoá ảnh + nhãn"))
+
+    for i in err_issues:
+        if i.code == "BAD_CLASS_NAME" and not renamed_classes:
+            renamed_classes = True
+            d = (yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}) if ds.yaml_path.exists() else {}
+            before_names = str(d.get("names", ""))
+            d["names"] = {idx: name for idx, name in enumerate(cfg["classes"])}
+            ds.yaml_path.write_text(yaml.safe_dump(d, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            fixes.append(dict(image="data.yaml", line="", action="rename_classes", before=before_names, after=str(cfg["classes"])))
+
+    seen_missing = set()
+    for i in err_issues:
+        if i.code == "MISSING_LABEL_FILE" and i.image not in removed_images and i.image not in seen_missing:
+            seen_missing.add(i.image)
+            fixes.append(dict(image=i.image, line="", action="needs_label", before="(không có file)", after="chuyển người gán"))
+
+    by_img = defaultdict(lambda: defaultdict(set))
+    for i in err_issues:
+        if i.code in LINE_CODES and i.image not in removed_images and i.line is not None:
+            by_img[i.image][i.line].add(i.code)
+
+    for stem, line_map in by_img.items():
+        lp = ds.label_path(stem)
+        if not lp.exists():
+            continue
+        raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_lines = []
+        for line_no, raw in enumerate(raw_lines, 1):
+            codes = line_map.get(line_no)
+            if not codes:
+                new_lines.append(raw)
+                continue
+            if codes & DROP_LINE_CODES:
+                fixes.append(dict(image=stem, line=line_no, action="drop_line", before=raw.strip(), after=""))
+            elif "BOX_OUT_OF_IMAGE" in codes:
+                after_line = _clip_yolo_line(raw)
+                if after_line is None:
+                    fixes.append(dict(image=stem, line=line_no, action="drop_line", before=raw.strip(), after=""))
+                else:
+                    new_lines.append(after_line)
+                    fixes.append(dict(image=stem, line=line_no, action="clip_box", before=raw.strip(), after=after_line))
+        lp.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+
+    return fixes
