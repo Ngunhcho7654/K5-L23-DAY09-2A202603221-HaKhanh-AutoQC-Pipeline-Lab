@@ -21,9 +21,85 @@ Gợi ý
 - `iou_xywh(a, b)` có sẵn trong common.py.
 - Ngưỡng nằm trong `cfg["label_format"]` — đừng viết cứng số vào code.
 """
-from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
+from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line
 
 
 def run(ds, cfg):
-    # TODO: duyệt từng file nhãn, từng dòng
-    raise NotImplementedError("check label_format chưa làm")
+    """Kiểm tra định dạng, ID lớp và hình học các dòng nhãn YOLO trong dataset."""
+    c = cfg["label_format"]
+    overflow_tol = c["overflow_tol"]
+    min_box_px = c["min_box_px"]
+    max_box_frac = c["max_box_frac"]
+    dup_box_iou = c["dup_box_iou"]
+    n_classes = len(ds.classes)
+    issues = []
+
+    for lf in ds.label_files():
+        stem = lf.stem
+        sz = ds.image_size(stem)
+        seen_boxes = []
+        for line_no, text in ds.read_label_lines(stem) or []:
+            try:
+                cls_id, cx, cy, w, h = parse_yolo_line(text)
+            except ValueError as e:
+                issues.append(Issue("label_format", ERROR, "BAD_FORMAT", stem, f"sai định dạng: {e}", line=line_no))
+                continue
+
+            if not (0 <= cls_id < n_classes):
+                issues.append(Issue("label_format", ERROR, "BAD_CLASS_ID", stem, f"id lớp {cls_id} ngoài 0..{n_classes - 1}", line=line_no))
+                continue
+
+            if w <= 0 or h <= 0:
+                issues.append(Issue("label_format", ERROR, "BOX_ZERO", stem, f"kích thước box <= 0 (w={w}, h={h})", line=line_no))
+                continue
+
+            x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+            over = max(0.0, -x1, -y1, x2 - 1.0, y2 - 1.0)
+            if over > overflow_tol:
+                issues.append(
+                    Issue(
+                        "label_format",
+                        ERROR,
+                        "BOX_OUT_OF_IMAGE",
+                        stem,
+                        f"box tràn ra ngoài ảnh ({over:.4f})",
+                        line=line_no,
+                        extra={"overflow": round(over, 6)},
+                    )
+                )
+
+            box = (cx, cy, w, h)
+            if any(p_cls == cls_id and iou_xywh(box, p_box) > dup_box_iou for p_cls, p_box in seen_boxes):
+                issues.append(Issue("label_format", ERROR, "DUP_BOX", stem, "box trùng lặp với dòng trước", line=line_no))
+            seen_boxes.append((cls_id, box))
+
+            if sz is not None:
+                width_px, height_px = sz
+                short_px = min(w * width_px, h * height_px)
+                if short_px < min_box_px:
+                    issues.append(
+                        Issue(
+                            "label_format",
+                            WARN,
+                            "BOX_TINY",
+                            stem,
+                            f"cạnh ngắn {short_px:.1f}px < {min_box_px}px",
+                            line=line_no,
+                            extra={"short_px": round(short_px, 2)},
+                        )
+                    )
+
+            if w * h > max_box_frac:
+                issues.append(
+                    Issue(
+                        "label_format",
+                        WARN,
+                        "BOX_HUGE",
+                        stem,
+                        f"diện tích box {w * h:.3f} > {max_box_frac}",
+                        line=line_no,
+                        extra={"area_frac": round(w * h, 4)},
+                    )
+                )
+
+    return issues
